@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>liquid-key behavior</title>
+<!--
+  Drives liquid-key through gestures on a clock the page turns by hand,
+  frame by frame, and checks what the key reports and draws: the bubble
+  swinging round the key, pulls on the diagonals at an edge, the size, the
+  haptics, and the bubble's lean. It runs on load and prints a line per
+  check; window.results has them too.
+-->
+<script>
+  // A clock the test turns by hand, installed before the key loads, so every
+  // check sees the same timers and the same frames.
+  (() => {
+    let now = 1000;
+    let ids = 1;
+    const timers = new Map();
+    const frames = new Map();
+    const settle = async () => { for (let i = 0; i < 6; i++) await null; };
+    window.clock = {
+      get now() { return now; },
+      settle,
+      // Forgets the timers and frames of keys already thrown away.
+      reset() {
+        timers.clear();
+        frames.clear();
+      },
+      // One 60 Hz frame: the timers due within it, each followed by its
+      // microtasks, then the frame's callbacks.
+      async frame() {
+        const until = now + 1000 / 60;
+        for (let fired = 0; ; fired++) {
+          if (fired > 1000) throw new Error(`timers loop at ${now}: ${[...timers.values()].map((t) => `${t.at}+${t.every} ${String(t.fn).slice(0, 80)}`).join(' | ')}`);
+          let next = null;
+          for (const [id, timer] of timers) {
+            if (timer.at > until) continue;
+            if (!next || timer.at < next[1].at || (timer.at === next[1].at && id < next[0])) next = [id, timer];
+          }
+          if (!next) break;
+          const [id, timer] = next;
+          now = Math.max(now, timer.at);
+          if (timer.every) timer.at += timer.every;
+          else timers.delete(id);
+          timer.fn();
+          await settle();
+        }
+        now = until;
+        const due = [...frames.values()];
+        frames.clear();
+        for (const fn of due) fn(now);
+        await settle();
+      },
+    };
+    performance.now = () => now;
+    window.setTimeout = (fn, ms = 0) => { const id = ids++; timers.set(id, { at: now + Math.max(0, ms), fn, every: 0 }); return id; };
+    window.clearTimeout = (id) => { timers.delete(id); };
+    window.setInterval = (fn, ms) => { const id = ids++; timers.set(id, { at: now + ms, fn, every: ms }); return id; };
+    window.clearInterval = (id) => { timers.delete(id); };
+    window.requestAnimationFrame = (fn) => { const id = ids++; frames.set(id, fn); return id; };
+    window.cancelAnimationFrame = (id) => { frames.delete(id); };
+    // The checks are in the geometry and state, not the pixels, and a WebGL
+    // context per key per check stalls a headless GPU: the keys draw with
+    // their 2D fallback here.
+    const getContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function (type, options) {
+      return type === 'webgl' ? null : getContext.call(this, type, options);
+    };
+  })();
+</script>
+<script src="../liquid-key.js"></script>
+<script src="../speech-engine.js"></script>
+<script src="../dictation.js"></script>
+<style>
+  body { margin: 0; background: #111; color: #ddd; font: 13px/1.5 ui-monospace, Menlo, monospace; }
+  .stage { display: flex; padding: 420px 240px 140px; }
+  pre { padding: 16px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div class="stage" id="stage"></div>
+<pre id="out">running…</pre>
+<script>
+  // Held and torn free above the key, the bubble swings round to the right
+  // and then over the top to the left with the finger, never back through
+  // the middle, re-arming as it goes.
+  async function swing() {
+    const stage = document.getElementById('stage');
+    stage.replaceChildren();
+    clock.reset();
+    const key = document.createElement('liquid-key');
+    stage.append(key);
+    const disconnect = connectDictation(key, new SpeechEngine());
+    const aims = [];
+    key.addEventListener('aim', ({ detail }) => aims.push(detail.action ?? 'none'));
+    await clock.settle();
+    const rect = key.getBoundingClientRect();
+    const pointer = (type, x, y) => key.dispatchEvent(new PointerEvent(type, {
+      pointerId: 3, pointerType: 'touch', isPrimary: true, bubbles: true, cancelable: true, composed: true,
+      clientX: rect.left + rect.width / 2 + x, clientY: rect.top + rect.height / 2 + y,
+    }));
+    let nearest = Infinity, swinging = false, armedThroughout = true;
+    const frame = async () => {
+      await clock.frame();
+      if (!swinging) return;
+      const [, bubble] = key.shapes();
+      nearest = Math.min(nearest, Math.hypot(bubble.x, bubble.y));
+      armedThroughout &&= key.shadowRoot.querySelector('.bubble').classList.contains('armed');
+    };
+    const to = async (x, y) => {
+      pointer('pointermove', x, y);
+      await clock.settle();
+      await frame();
+    };
+    pointer('pointerdown', 0, 0);
+    for (let i = 0; i < 30; i++) await frame();
+    for (let i = 1; i <= 15; i++) await to(0, (-110 * i) / 15);
+    for (let i = 0; i < 10; i++) await frame();
+    swinging = true;
+    const around = async (from, until, frames) => {
+      for (let i = 1; i <= frames; i++) {
+        const angle = from + ((until - from) * i) / frames;
+        await to(110 * Math.cos(angle), 110 * Math.sin(angle));
+      }
+      for (let i = 0; i < 10; i++) await frame();
+    };
+    await around(-Math.PI / 2, 0, 24);
+    await around(0, -Math.PI, 48);
+    swinging = false;
+    pointer('pointerup', -110, 0);
+    await clock.settle();
+    disconnect();
+    const expected = ['send', 'none', 'fix', 'none', 'send', 'none', 'undo'];
+    const pass = nearest > PART && armedThroughout && aims.join() === expected.join();
+    return { name: 'swing up to right, then over the top to left', pass, nearest, armedThroughout, aims, expected };
+  }
+  const PART = 66;
+
+  // The size attribute and pulls on the diagonals, on a bare key: what it
+  // reports as the finger or the arrow keys go round.
+  const DICTATION = { up: { action: 'send' }, left: { action: 'undo' }, right: { action: 'fix' } };
+  const KEY_RIGHT = { up: { action: 'send' }, left: { action: 'undo' }, 'up-left': { action: 'fix' } };
+  const KEY_LEFT = { up: { action: 'send' }, right: { action: 'fix' }, 'up-right': { action: 'undo' } };
+  async function behave(name, setup, script) {
+    const stage = document.getElementById('stage');
+    stage.replaceChildren();
+    clock.reset();
+    const key = document.createElement('liquid-key');
+    stage.append(key);
+    setup(key);
+    const seen = [];
+    // What the key asks the phone to vibrate: 8 a tick, 24 the heavy one.
+    const buzz = [];
+    navigator.vibrate = (pattern) => buzz.push(pattern);
+    key.addEventListener('aim', ({ detail }) => seen.push(`aim ${detail.action ?? 'none'}`));
+    key.addEventListener('action', ({ detail }) => seen.push(`action ${detail.action}`));
+    key.addEventListener('release', () => seen.push('release'));
+    await clock.settle();
+    const rect = key.getBoundingClientRect();
+    const at = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    let finger = { x: 0, y: 0 };
+    const pointer = (type) => key.dispatchEvent(new PointerEvent(type, {
+      pointerId: 4, pointerType: 'touch', isPrimary: true, bubbles: true, cancelable: true, composed: true,
+      clientX: at.x + finger.x, clientY: at.y + finger.y,
+    }));
+    const frames = async (count) => { for (let i = 0; i < count; i++) await clock.frame(); };
+    const tools = {
+      key, seen, buzz, frames,
+      down: async () => { finger = { x: 0, y: 0 }; pointer('pointerdown'); await clock.settle(); await frames(30); },
+      to: async (x, y) => { finger = { x, y }; pointer('pointermove'); await clock.settle(); await frames(1); },
+      around: async (radius, from, until, steps) => {
+        for (let i = 1; i <= steps; i++) {
+          const angle = from + ((until - from) * i) / steps;
+          await tools.to(radius * Math.cos(angle), radius * Math.sin(angle));
+        }
+      },
+      up: async () => { pointer('pointerup'); await clock.settle(); await frames(20); },
+      press: async (type, name) => { key.dispatchEvent(new KeyboardEvent(type, { key: name, bubbles: true, cancelable: true })); await clock.settle(); await frames(3); },
+    };
+    const { pass, detail } = await script(tools);
+    return { name, pass, detail: detail ?? seen.join(' → ') };
+  }
+
+  const BEHAVIORS = [
+    () => behave('a 52 px key arms 67 px out, not 88', (key) => { key.size = 52; key.pulls = DICTATION; }, async (t) => {
+      await t.down();
+      for (let y = 5; y <= 60; y += 5) await t.to(0, -y);
+      const at60 = t.key.s.aim;
+      for (let y = 62; y <= 70; y += 2) await t.to(0, -y);
+      const at70 = t.key.s.aim;
+      await t.up();
+      return { pass: at60 === null && at70 === 'up', detail: `armed at 60 px: ${at60 ?? 'no'}; at 70 px: ${at70 ?? 'no'}` };
+    }),
+    () => behave('key on the right: up, over to up-left, to left', (key) => { key.size = 52; key.pulls = KEY_RIGHT; }, async (t) => {
+      await t.down();
+      for (let y = 10; y <= 90; y += 10) await t.to(0, -y);
+      await t.around(90, -Math.PI / 2, -Math.PI, 36);
+      await t.up();
+      return { pass: t.seen.join() === ['aim send', 'aim none', 'aim fix', 'aim none', 'aim undo', 'action undo'].join() };
+    }),
+    () => behave('key on the left: up, over to up-right, to right', (key) => { key.size = 52; key.pulls = KEY_LEFT; }, async (t) => {
+      await t.down();
+      for (let y = 10; y <= 90; y += 10) await t.to(0, -y);
+      await t.around(90, -Math.PI / 2, 0, 36);
+      await t.up();
+      return { pass: t.seen.join() === ['aim send', 'aim none', 'aim undo', 'aim none', 'aim fix', 'action fix'].join() };
+    }),
+    () => behave('short of arming, each retarget ticks once', (key) => { key.pulls = DICTATION; }, async (t) => {
+      await t.down();
+      for (let y = 10; y <= 70; y += 10) await t.to(0, -y);
+      await t.around(70, -Math.PI / 2, 0, 24);
+      await t.around(70, 0, -Math.PI / 2, 24);
+      await t.up();
+      return { pass: t.buzz.join() === '8,8' && t.seen.join() === 'release', detail: `vibrations: ${t.buzz.join(', ')} · ${t.seen.join(' → ')}` };
+    }),
+    () => behave('armed, a retarget buzzes once, not twice', (key) => { key.pulls = DICTATION; }, async (t) => {
+      await t.down();
+      for (let y = 10; y <= 110; y += 10) await t.to(0, -y);
+      await t.around(110, -Math.PI / 2, 0, 24);
+      await t.up();
+      return { pass: t.buzz.join() === '24,8', detail: `vibrations: ${t.buzz.join(', ')} · ${t.seen.join(' → ')}` };
+    }),
+    () => behave('the bubble leans halfway, then swings across', (key) => { key.pulls = DICTATION; }, async (t) => {
+      const degrees = (radians) => Math.round((radians * 180) / Math.PI);
+      await t.down();
+      for (let y = 10; y <= 70; y += 10) await t.to(0, -y);
+      await t.around(70, -Math.PI / 2, -Math.PI / 3, 8);
+      const before = degrees(t.key.sp.bubble.angle.target);
+      await t.around(70, -Math.PI / 3, -Math.PI / 6, 8);
+      const after = degrees(t.key.sp.bubble.angle.target);
+      await t.up();
+      return { pass: before === -75 && after === -15, detail: `finger at -60°: bubble at ${before}° (toward up); finger at -30°: bubble at ${after}° (toward right)` };
+    }),
+    () => behave('arrow keys reach the diagonal', (key) => { key.pulls = KEY_RIGHT; }, async (t) => {
+      await t.press('keydown', ' ');
+      await t.frames(30);
+      await t.press('keydown', 'ArrowLeft');
+      await t.press('keydown', 'ArrowRight');
+      await t.press('keyup', ' ');
+      await t.frames(10);
+      return { pass: t.seen.join() === ['aim undo', 'aim none', 'aim fix', 'action fix'].join() };
+    }),
+  ];
+
+  // A real turn of the event loop, which the hand-turned clock never gives.
+  const yieldToPage = () => new Promise((resolve) => {
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () => resolve();
+    channel.port2.postMessage(null);
+  });
+
+  window.results = null;
+  window.runAll = async () => {
+    const results = [];
+    const swung = await swing();
+    results.push({
+      name: swung.name,
+      pass: swung.pass,
+      detail: `nearest the bubble came to the key's center: ${swung.nearest.toFixed(1)} px (it tears at ${PART}); ` +
+        `stayed armed: ${swung.armedThroughout}; aims: ${swung.aims.join(' → ')}`,
+    });
+    for (const behavior of BEHAVIORS) {
+      results.push(await behavior());
+      await yieldToPage();
+    }
+    window.results = results;
+    document.getElementById('out').textContent = results.map((r) => `${r.pass ? '✓' : '✗'} ${r.name}\n    ${r.detail}`).join('\n');
+    return results;
+  };
+  addEventListener('load', () => runAll());
+</script>
+</body>
+</html>
